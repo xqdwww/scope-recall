@@ -45,7 +45,7 @@ class BenchmarkProvider:
         self._lock = threading.RLock()
         self._conn = sqlite3.connect(":memory:")
         self._conn.row_factory = sqlite3.Row
-        self._conn.execute("CREATE TABLE memories(id TEXT PRIMARY KEY, scope_id TEXT NOT NULL, metadata TEXT NOT NULL DEFAULT '{}')")
+        self._conn.execute("CREATE TABLE memories(id TEXT PRIMARY KEY, scope_id TEXT NOT NULL, retrieval_excluded INTEGER NOT NULL DEFAULT 0, metadata TEXT NOT NULL DEFAULT '{}')")
         ensure_graph_schema(self._conn)
         for item in self._items:
             scope_id = str((item.metadata or {}).get("scope_id") or self._shared_scope_id)
