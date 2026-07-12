@@ -1688,6 +1688,19 @@ def test_recall_merge_preserves_incoming_recency_metadata(tmp_path):
         plugin._search_vector_memories = lambda query, limit: [newer]
         plugin._search_curated_memories = lambda query: []
 
+        # Ensure candidate IDs exist in the memories table so the
+        # positive-eligibility contract can verify them.
+        conn = plugin._require_conn()
+        for item in (older, newer):
+            conn.execute(
+                "INSERT OR IGNORE INTO memories "
+                "(id, scope_id, content, summary, source, target, created_at, updated_at, retrieval_excluded) "
+                "VALUES (?, ?, ?, ?, ?, ?, '2026-01-01T00:00:00Z', ?, 0)",
+                (item.id, "default", item.content, item.summary,
+                 item.source, item.target, item.updated_at),
+            )
+        conn.commit()
+
         results = plugin._recall_service.search_memories("Joy concise answers", limit=1)
     finally:
         plugin.shutdown()

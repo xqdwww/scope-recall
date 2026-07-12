@@ -53,32 +53,58 @@ class DummyProvider:
 
     def _search_db_memories(self, query, *, limit):
         if self._db_items is not None:
-            return self._db_items[:limit]
-        return [
-            RecallItem(
-                id="general-1",
-                content="Deploy command is uv run app.",
-                summary="Deploy command is uv run app.",
-                source="turn-user",
-                target="general",
-                score=1.0,
-                updated_at="2026-05-01T00:00:00+00:00",
-                metadata={"lexical_score": 1.0, "vector_score": 0.0, "scope_id": self._scope_id},
-            ),
-            RecallItem(
-                id="memory-1",
-                content="Deploy command is uv run app.",
-                summary="Deploy command is uv run app.",
-                source="tool-store",
-                target="memory",
-                score=0.8,
-                updated_at="2026-05-01T00:00:00+00:00",
-                metadata={"lexical_score": 0.8, "vector_score": 0.0, "scope_id": self._shared_scope_id},
-            ),
-        ]
+            items = self._db_items[:limit]
+        else:
+            items = [
+                RecallItem(
+                    id="general-1",
+                    content="Deploy command is uv run app.",
+                    summary="Deploy command is uv run app.",
+                    source="turn-user",
+                    target="general",
+                    score=1.0,
+                    updated_at="2026-05-01T00:00:00+00:00",
+                    metadata={"lexical_score": 1.0, "vector_score": 0.0, "scope_id": self._scope_id},
+                ),
+                RecallItem(
+                    id="memory-1",
+                    content="Deploy command is uv run app.",
+                    summary="Deploy command is uv run app.",
+                    source="tool-store",
+                    target="memory",
+                    score=0.8,
+                    updated_at="2026-05-01T00:00:00+00:00",
+                    metadata={"lexical_score": 0.8, "vector_score": 0.0, "scope_id": self._shared_scope_id},
+                ),
+            ]
+        # Ensure each candidate's ID exists in the memories table so the
+        # positive-eligibility contract in _filter_eligible can verify it.
+        for item in items:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO memories "
+                "(id, scope_id, content, summary, source, target, created_at, updated_at, retrieval_excluded) "
+                "VALUES (?, ?, ?, ?, ?, ?, '2026-01-01T00:00:00Z', ?, 0)",
+                (item.id, str((item.metadata or {}).get("scope_id", self._scope_id)),
+                 item.content, item.summary, item.source, item.target, item.updated_at),
+            )
+        self._conn.commit()
+        return items
 
     def _search_vector_memories(self, query, *, limit):
-        return self._vector_items[:limit]
+        items = self._vector_items[:limit]
+        # Insert vector-sourced candidates into the memories table so the
+        # positive-eligibility contract can verify them.
+        for item in items:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO memories "
+                "(id, scope_id, content, summary, source, target, created_at, updated_at, retrieval_excluded) "
+                "VALUES (?, ?, ?, ?, ?, ?, '2026-01-01T00:00:00Z', ?, 0)",
+                (item.id, str((item.metadata or {}).get("scope_id", self._scope_id)),
+                 item.content, item.summary, item.source, item.target, item.updated_at),
+            )
+        if items:
+            self._conn.commit()
+        return items
 
     def _search_curated_memories(self, query):
         return []

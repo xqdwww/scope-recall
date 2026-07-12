@@ -18,6 +18,7 @@ from .graph import apply_quality_weight, entity_distance_scores, entity_overlap_
 from .models import RecallItem
 from .recall_pipeline import build_search_plan, final_trace_payload, initial_trace, merge_recall_candidates, rank_recall_items
 from .scoring import combine_scores, reciprocal_rank_fusion
+from .storage_views import _retrieval_eligible_ids
 
 _logger = logging.getLogger(__name__)
 
@@ -685,9 +686,21 @@ class RecallService:
         * All other items are database-backed and require:
             1. A working SQLite connection (``_require_conn()``)
             2. The ``retrieval_excluded`` column in the schema
-            3. A successful query confirming ``retrieval_excluded = 0``
+            3. Positive eligibility proof via
+               ``_retrieval_eligible_ids()`` — the ID must exist in the
+               ``memories`` table AND ``retrieval_excluded`` must be ``0``.
         * If ANY of the above fails, ALL database-backed candidates are
           rejected — never allowed through unverified.
+
+        Positive proof vs negative set
+        ------------------------------
+        This method uses a **positive** eligibility query:
+        ``SELECT id FROM memories WHERE id IN (...) AND retrieval_excluded = 0``.
+        An ID that does not appear in the query result — whether because it
+        does not exist in the table, has been deleted, has
+        ``retrieval_excluded = 1``, or the query itself failed — is rejected.
+        This is strictly stronger than the older "excluded-set" approach
+        which could not distinguish unknown IDs from eligible ones.
 
         This is the last line of defense; individual retrieval paths (FTS,
         LIKE, alias, vector) are expected to pre-filter at the SQL/query
@@ -727,29 +740,36 @@ class RecallService:
             )
             return curated
 
-        # --- Step 3: query excluded IDs ---
-        try:
-            excluded: set[str] = {
-                str(row[0])
-                for row in conn.execute(
-                    "SELECT id FROM memories WHERE retrieval_excluded = 1"
-                ).fetchall()
-            }
-        except Exception as exc:
-            _logger.error(
-                "Fail-closed: rejecting %d database-backed candidates "
-                "(eligibility query failed: %s)",
-                len(db_backed), exc,
-            )
+        # --- Step 3: query eligible IDs (positive proof) ---
+        # Collect all non-None, non-empty database-backed IDs.
+        # None/empty IDs cannot exist in SQLite and will sink to the
+        # bottom of the eligibility check (they won't match any row).
+        db_ids: list[str] = [item.id for item in db_backed if item.id]
+        if not db_ids:
+            # All db_backed items had None or empty IDs — nothing can pass.
             return curated
 
+        # Delegate to the unified positive-eligibility helper that
+        # chunk-parametrises the query and returns IDs that exist in the
+        # memories table AND have retrieval_excluded = 0.
+        #
+        # An ID that is:
+        #   * not in the memories table (unknown, deleted, stale)  → excluded
+        #   * in the table but retrieval_excluded = 1               → excluded
+        #   * in the table and retrieval_excluded = 0               → eligible
+        #
+        # On any SQL error the helper returns the empty set, which causes
+        # ALL database-backed candidates to be rejected (fail-closed).
+        eligible_ids = _retrieval_eligible_ids(conn, db_ids)
+
         # --- Step 4: filter ---
-        # Reject items with None or empty ID (cannot be verified)
-        # and items whose ID appears in the excluded set.
+        # Only items whose ID appears in the eligible set may pass.
+        # Items with None/empty IDs (excluded from db_ids above) are
+        # implicitly rejected — they cannot appear in the query result.
         filtered: list[RecallItem] = [
             item
             for item in db_backed
-            if item.id and item.id not in excluded
+            if item.id and item.id in eligible_ids
         ]
         return curated + filtered
 

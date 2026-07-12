@@ -52,33 +52,52 @@ Semantic boundary with superseded_by:
 
 def _retrieval_eligible_ids(conn: sqlite3.Connection, ids: list[str]) -> set[str]:
     """Return the subset of IDs that are eligible for default retrieval
-    (retrieval_excluded = 0).
+    (retrieval_excluded = 0) — positive proof of existence + eligibility.
 
-    Returns an empty set (no results) on any SQL error rather than
-    silently returning unfiltered candidates.
+    Positive-eligibility contract
+    -----------------------------
+    * An ID is eligible only if:
+        1. It exists in the ``memories`` table, AND
+        2. Its ``retrieval_excluded`` column is ``0``.
+    * IDs that are absent from the table (unknown, stale, deleted) are
+      never eligible.
+    * IDs that exist but have ``retrieval_excluded = 1`` are never eligible.
+    * On any SQL error the result is the empty set (fail-closed).
+
+    Chunking
+    --------
+    SQLite has a compile-time limit of ``SQLITE_MAX_VARIABLE_NUMBER``
+    (default 999).  We chunk at 900 to stay well below the limit.  Each
+    chunk is a separate parameterised query; results are unioned before
+    return.  Deduplication is implicit — an ID is either in the result
+    set or not.
     """
     if not ids:
         return set()
+    chunk_size = 900
+    result: set[str] = set()
     try:
-        placeholders = ",".join("?" for _ in ids)
-        eligible = {
-            str(row["id"])
-            for row in conn.execute(
+        for i in range(0, len(ids), chunk_size):
+            chunk = ids[i:i + chunk_size]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = conn.execute(
                 f"SELECT id FROM memories WHERE id IN ({placeholders}) AND retrieval_excluded = 0",
-                ids,
+                chunk,
             ).fetchall()
-        }
+            result.update(str(row["id"]) for row in rows)
     except Exception:
         # Fail-closed: on any query error, return empty — no results pass through.
         return set()
-    return eligible
+    return result
 
 
 def _excluded_ids(conn: sqlite3.Connection) -> set[str]:
-    """Return all IDs with retrieval_excluded=1.
+    """Return all IDs with retrieval_exclusion=1.
 
-    Used by the fail-closed merge layer (recall.py) to strip excluded
-    records from the final candidate list regardless of source path.
+    Legacy helper — superseded by ``_retrieval_eligible_ids()`` which
+    uses a positive proof of existence + eligibility contract.  This
+    function is retained for backward compatibility but is NOT used
+    by the merge layer in recall.py (which now uses positive eligibility).
     """
     try:
         return {

@@ -19,7 +19,6 @@ from scope_recall.sql_store import (
 )
 from scope_recall.storage_views import (
     RETRIEVAL_ELIGIBLE_WHERE,
-    _excluded_ids,
     _retrieval_eligible_ids,
     search_archived_memories,
     search_curated_memories,
@@ -604,15 +603,143 @@ def test_merge_layer_fail_closed_preserves_curated():
 
 
 def test_merge_layer_unknown_id_rejected():
-    """Items with unknown ID namespace (not curated:*) must be default-rejected
-    when connection is unavailable."""
+    """Items with unknown IDs (not in memories table) must be rejected
+    by _filter_eligible even with a working SQLite connection.
+
+    This proves the positive-eligibility contract: an ID that does not
+    exist in the memories table must NOT be returned, regardless of
+    whether the retrieval_excluded column would have excluded it.
+    """
+    conn = _conn()
+    _store(conn, memory_id="id-existing", content="Real memory in DB.")
+
+    # Candidate with an ID that does not exist in the memories table
     unknown_item = _make_item("unknown-ns:some-id", content="Unknown namespace.")
-    provider = FailingProvider(db_items=[unknown_item])
+    existing_item = _make_item("id-existing", content="Real memory.")
+
+    class TestProvider:
+        def __init__(self, conn):
+            self._conn = conn
+        def _require_conn(self):
+            return self._conn
+        def _dedup_key(self, content):
+            return dedup_key(content)
+
+    provider = TestProvider(conn)
     service = RecallService(provider)
-    results = service.search_memories("unknown", limit=5)
-    assert "unknown-ns:some-id" not in {item.id for item in results}, (
-        "Unknown-namespace item leaked through merge layer"
+
+    # Test _filter_eligible directly — this is the correct unit boundary
+    result = service._filter_eligible([existing_item, unknown_item])
+    ids = {item.id for item in result}
+
+    assert "id-existing" in ids, "Existing eligible memory was incorrectly rejected"
+    assert "unknown-ns:some-id" not in ids, (
+        "Unknown-namespace item leaked through merge layer despite "
+        "working connection (positive eligibility should reject it)"
     )
+
+
+def test_merge_layer_32char_hex_id_not_in_db_rejected():
+    """A 32-character hex-format ID that does not exist in memories must
+    be rejected by the positive-eligibility merge layer (_filter_eligible).
+
+    Real database-backed memory IDs are 32-character hex strings.
+    A randomly generated one that was never inserted cannot pass
+    the eligibility check.
+    """
+    conn = _conn()
+    _store(conn, memory_id="real-001", content="Real memory.")
+    fake_hex_id = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"
+
+    class TestProvider:
+        def __init__(self, conn):
+            self._conn = conn
+        def _require_conn(self):
+            return self._conn
+        def _dedup_key(self, content):
+            return dedup_key(content)
+
+    provider = TestProvider(conn)
+    service = RecallService(provider)
+
+    # Test _filter_eligible directly
+    result = service._filter_eligible([
+        _make_item("real-001", content="Real memory."),
+        _make_item(fake_hex_id, content="Fake hex candidate."),
+    ])
+    ids = {item.id for item in result}
+
+    assert "real-001" in ids, "Existing memory was incorrectly rejected"
+    assert fake_hex_id not in ids, (
+        f"Fake hex ID {fake_hex_id} leaked through merge layer "
+        "(positive eligibility should reject it since it was never inserted)"
+    )
+
+
+def test_merge_layer_positive_eligibility_mixed():
+    """Prove the positive-eligibility contract by testing _filter_eligible
+    directly with a mixed input:
+
+    - eligible: ID exists in memories, retrieval_excluded=0  → should pass
+    - excluded: ID exists in memories, retrieval_excluded=1  → should be rejected
+    - missing:  ID does not exist in memories                → should be rejected
+    - empty:    ID is empty string                           → should be rejected
+    - None:     ID is None                                   → should be rejected
+    - curated:  ID starts with curated:                      → should pass (independent domain)
+
+    Final result must contain only: eligible + curated.
+    """
+    conn = _conn()
+
+    # Insert records into the real DB
+    _store(conn, memory_id="id-eligible", content="Eligible memory.", retrieval_excluded=0)
+    _store(conn, memory_id="id-excluded", content="Excluded memory.", retrieval_excluded=1)
+
+    class TestProvider:
+        def __init__(self, conn):
+            self._conn = conn
+        def _require_conn(self):
+            return self._conn
+        def _dedup_key(self, content):
+            return dedup_key(content)
+
+    provider = TestProvider(conn)
+    service = RecallService(provider)
+
+    # Build six candidates
+    eligible = _make_item("id-eligible", content="Eligible.")
+    excluded = _make_item("id-excluded", content="Excluded.")
+    missing = _make_item("id-missing-from-db", content="Missing.")
+    empty = _make_item("", content="Empty ID.")
+    # None-ID item
+    none_item = RecallItem(
+        id=None, content="None ID.", summary="None.", source="test",
+        target="memory", score=0.5,
+        updated_at="2026-01-01T00:00:00+00:00",
+        metadata={"lexical_score": 0.5, "vector_score": 0.0},
+    )
+    curated = RecallItem(
+        id="curated:user:abc123", content="Curated tip.", summary="Curated tip.",
+        source="builtin-curated", target="user", score=0.5,
+        updated_at="2026-01-01T00:00:00+00:00",
+        metadata={"lexical_score": 0.5, "vector_score": 0.0},
+    )
+
+    result = service._filter_eligible([
+        eligible, excluded, missing, empty, none_item, curated,
+    ])
+    ids = {item.id for item in result}
+
+    # Must pass
+    assert "id-eligible" in ids, "Eligible memory incorrectly rejected"
+    assert "curated:user:abc123" in ids, "Curated item incorrectly rejected"
+    # Must NOT pass
+    assert "id-excluded" not in ids, "Excluded memory leaked"
+    assert "id-missing-from-db" not in ids, "Missing (nonexistent) ID leaked"
+    assert "" not in ids, "Empty ID leaked"
+    assert None not in ids, "None ID leaked"
+    # Exactly 2 items should survive
+    assert len(ids) == 2, f"Expected 2 surviving items, got {len(ids)}: {ids}"
 
 
 def test_merge_layer_empty_id_rejected():
