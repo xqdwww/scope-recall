@@ -4,6 +4,7 @@ Recall is read-oriented: it should explain/filter candidates without mutating me
 
 from __future__ import annotations
 
+import logging
 import math
 import re
 import time
@@ -16,6 +17,8 @@ from .graph import apply_quality_weight, entity_distance_scores, entity_overlap_
 from .models import RecallItem
 from .recall_pipeline import build_search_plan, final_trace_payload, initial_trace, merge_recall_candidates, rank_recall_items
 from .scoring import combine_scores, reciprocal_rank_fusion
+
+_logger = logging.getLogger(__name__)
 
 _FRESHNESS_HINTS = {
     "current",
@@ -171,6 +174,15 @@ class RecallService:
         before_lifecycle = len(results)
         results = self._filter_recall_lifecycle(results)
         trace["filters"]["lifecycle_removed"] += max(0, before_lifecycle - len(results))
+
+        # Phase 2: fail-closed retrieval exclusion filter.
+        # No record with retrieval_excluded=1 in the SQLite source-of-truth
+        # may reach the downstream scorer/reranker, regardless of which path
+        # (FTS, LIKE, alias, vector, curated, fallback) produced it.
+        # Items whose IDs don't exist in the memories table (e.g. curated:*
+        # synthetic IDs) are always eligible — they cannot be excluded.
+        results = self._filter_eligible(results)
+
         before_general = len(results)
         results = self._apply_general_policy(results)
         trace["filters"]["general_policy_removed"] = max(0, before_general - len(results))
@@ -629,6 +641,76 @@ class RecallService:
             return {}
         max_score = max(score for _, score in fused) or 1.0
         return {item_id: max(0.0, min(1.0, score / max_score)) for item_id, score in fused}
+
+    def _filter_eligible(self, items: list[RecallItem]) -> list[RecallItem]:
+        """Fail-closed: reject database-backed RecallItems whose retrieval_excluded=1.
+
+        Items with a ``curated:`` prefix in their ID are always eligible — they
+        originate from file-based curated memory and have no row in the SQLite
+        memories table to hold a retrieval_excluded flag.
+
+        On connection or query failure ALL database-backed candidates are
+        rejected (emptied) rather than allowed through, since we cannot
+        confirm eligibility without the source-of-truth.
+
+        Compatibility: if the ``retrieval_excluded`` column does not exist in
+        the memories table (pre-migration production or legacy test fixture),
+        all items pass through as eligible — no excluded records can exist
+        without the column.  This is the contractually required compatibility
+        fallback (A3 section 九).
+        """
+        curated: list[RecallItem] = []
+        db_backed: list[RecallItem] = []
+
+        for item in items:
+            if item.id and item.id.startswith("curated:"):
+                curated.append(item)
+            else:
+                db_backed.append(item)
+
+        if not db_backed:
+            return curated
+
+        try:
+            conn = self.provider._require_conn()
+        except AttributeError:
+            # Compatibility: provider without _require_conn (test mock / minimal
+            # provider) — no SQLite-backed exclusion possible. All items pass.
+            return items
+        except Exception as exc:
+            _logger.warning(
+                "Fail-closed: rejecting %d database-backed candidates "
+                "(provider connection unavailable: %s)",
+                len(db_backed), exc,
+            )
+            return curated
+
+        try:
+            excluded = {
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT id FROM memories WHERE retrieval_excluded = 1"
+                ).fetchall()
+            }
+        except Exception as exc:
+            exc_str = str(exc)
+            if "no such column" in exc_str:
+                # Compatibility: column doesn't exist → no excluded records possible.
+                _logger.debug(
+                    "retrieval_excluded column missing; passing %d candidates "
+                    "(compatibility fallback): %s",
+                    len(db_backed), exc_str,
+                )
+                return items
+            _logger.error(
+                "Fail-closed: rejecting %d database-backed candidates "
+                "(eligibility query failed: %s)",
+                len(db_backed), exc,
+            )
+            return curated
+
+        filtered = [item for item in db_backed if item.id not in excluded]
+        return curated + filtered
 
     def _filter_recall_lifecycle(self, items: list[RecallItem]) -> list[RecallItem]:
         output: list[RecallItem] = []

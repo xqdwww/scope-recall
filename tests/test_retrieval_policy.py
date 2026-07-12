@@ -21,6 +21,35 @@ class DummyProvider:
         self._accessible_scope_ids = [self._scope_id, self._shared_scope_id]
         self._db_items = db_items
         self._vector_items = list(vector_items or [])
+        # Create a real :memory: SQLite connection so _filter_eligible() can
+        # query for excluded IDs (returning empty set = all items eligible).
+        import sqlite3
+        from scope_recall.sql_store import ensure_memory_columns
+        self._conn = sqlite3.connect(":memory:")
+        self._conn.row_factory = sqlite3.Row
+        self._conn.executescript("""
+            CREATE TABLE IF NOT EXISTS memories (
+                id TEXT PRIMARY KEY,
+                scope_id TEXT NOT NULL DEFAULT 'default',
+                source TEXT NOT NULL DEFAULT 'test',
+                target TEXT NOT NULL DEFAULT 'memory',
+                content TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT '2026-01-01T00:00:00Z',
+                updated_at TEXT NOT NULL DEFAULT '2026-01-01T00:00:00Z'
+            );
+        """)
+        ensure_memory_columns(self._conn)
+
+    def _require_conn(self):
+        return self._conn
+
+    def _config_value(self, key, default=None):
+        return self._retrieval_config.get(key, default)
+
+    def _dedup_key(self, content):
+        from scope_recall.gating import dedup_key
+        return dedup_key(content)
 
     def _search_db_memories(self, query, *, limit):
         if self._db_items is not None:

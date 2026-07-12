@@ -502,6 +502,10 @@ def _add_memory_column(conn: sqlite3.Connection, column: str) -> None:
         "gateway_session_key": "ALTER TABLE memories ADD COLUMN gateway_session_key TEXT",
         "dedup_key": "ALTER TABLE memories ADD COLUMN dedup_key TEXT",
         "metadata": "ALTER TABLE memories ADD COLUMN metadata TEXT",
+        "retrieval_excluded": "ALTER TABLE memories ADD COLUMN retrieval_excluded INTEGER NOT NULL DEFAULT 0",
+        "retrieval_excluded_at": "ALTER TABLE memories ADD COLUMN retrieval_excluded_at TEXT",
+        "retrieval_exclusion_batch_id": "ALTER TABLE memories ADD COLUMN retrieval_exclusion_batch_id TEXT",
+        "retrieval_exclusion_reason": "ALTER TABLE memories ADD COLUMN retrieval_exclusion_reason TEXT",
     }
     statement = allowed.get(column)
     if statement is None:
@@ -511,7 +515,9 @@ def _add_memory_column(conn: sqlite3.Connection, column: str) -> None:
 
 def ensure_memory_columns(conn: sqlite3.Connection) -> None:
     existing = {row[1] for row in conn.execute("PRAGMA table_info(memories)").fetchall()}
-    for column in ("chat_id", "thread_id", "gateway_session_key", "dedup_key", "metadata"):
+    for column in ("chat_id", "thread_id", "gateway_session_key", "dedup_key", "metadata",
+                   "retrieval_excluded", "retrieval_excluded_at", "retrieval_exclusion_batch_id",
+                   "retrieval_exclusion_reason"):
         if column not in existing:
             _add_memory_column(conn, column)
     for row in conn.execute("SELECT id, content FROM memories WHERE dedup_key IS NULL OR dedup_key = ''").fetchall():

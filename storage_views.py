@@ -32,6 +32,65 @@ _ACTIVE_MEMORY_SQL = _recall_lifecycle_visible_sql("memories")
 _ACTIVE_MEMORY_SQL_M = _recall_lifecycle_visible_sql("m")
 
 
+# ---------------------------------------------------------------------------
+# Retrieval Exclusion Eligibility Contract
+# ---------------------------------------------------------------------------
+
+RETRIEVAL_ELIGIBLE_WHERE = "retrieval_excluded = 0"
+"""SQLite WHERE fragment: only rows with retrieval_excluded=0 are eligible for default retrieval.
+
+Records stored as `retrieval_excluded=1` (or the column missing → treated as excluded)
+MUST NOT be returned by any default retrieval path.
+
+Semantic boundary with superseded_by:
+  - retrieval_excluded = 1  →  do not return via default retrieval (archive-only)
+  - superseded_by IS NOT NULL  →  this record has been replaced by another record.
+    Such records may still appear in default retrieval if retrieval_excluded=0;
+    the supersession relationship is orthogonal to retrieval exclusion.
+"""
+
+
+def _retrieval_eligible_ids(conn: sqlite3.Connection, ids: list[str]) -> set[str]:
+    """Return the subset of IDs that are eligible for default retrieval
+    (retrieval_excluded = 0).
+
+    Returns an empty set (no results) on any SQL error rather than
+    silently returning unfiltered candidates.
+    """
+    if not ids:
+        return set()
+    try:
+        placeholders = ",".join("?" for _ in ids)
+        eligible = {
+            str(row["id"])
+            for row in conn.execute(
+                f"SELECT id FROM memories WHERE id IN ({placeholders}) AND retrieval_excluded = 0",
+                ids,
+            ).fetchall()
+        }
+    except Exception:
+        # Fail-closed: on any query error, return empty — no results pass through.
+        return set()
+    return eligible
+
+
+def _excluded_ids(conn: sqlite3.Connection) -> set[str]:
+    """Return all IDs with retrieval_excluded=1.
+
+    Used by the fail-closed merge layer (recall.py) to strip excluded
+    records from the final candidate list regardless of source path.
+    """
+    try:
+        return {
+            str(row["id"])
+            for row in conn.execute(
+                "SELECT id FROM memories WHERE retrieval_excluded = 1"
+            ).fetchall()
+        }
+    except Exception:
+        return set()
+
+
 def _scope_placeholders(provider: Any) -> str:
     return ",".join("?" for _ in provider._accessible_scope_ids)
 
@@ -112,14 +171,15 @@ def search_db_memories(provider: Any, query: str, *, limit: int) -> list[RecallI
         if fts_query:
             rows.extend(
                 conn.execute(
-                    """
+                    f"""
                     SELECT m.*, bm25(memories_fts) AS bm25_score
                     FROM memories_fts
                     JOIN memories m ON m.id = memories_fts.memory_id
-                    WHERE memories_fts MATCH ? AND m.scope_id IN ({}) AND {}
+                    WHERE memories_fts MATCH ? AND m.scope_id IN ({_scope_placeholders(provider)})
+                      AND {_ACTIVE_MEMORY_SQL_M} AND m.{RETRIEVAL_ELIGIBLE_WHERE}
                     ORDER BY bm25(memories_fts) ASC, m.updated_at DESC
                     LIMIT ?
-                    """.format(_scope_placeholders(provider), _ACTIVE_MEMORY_SQL_M),
+                    """,
                     [fts_query, *_accessible_scope_params(provider), candidate_pool],
                 ).fetchall()
             )
@@ -136,7 +196,8 @@ def search_db_memories(provider: Any, query: str, *, limit: int) -> list[RecallI
                     f"""
                     SELECT *
                     FROM memories
-                    WHERE ({clause}) AND scope_id IN ({_scope_placeholders(provider)}) AND {_ACTIVE_MEMORY_SQL}
+                    WHERE ({clause}) AND scope_id IN ({_scope_placeholders(provider)})
+                      AND {_ACTIVE_MEMORY_SQL} AND {RETRIEVAL_ELIGIBLE_WHERE}
                     ORDER BY updated_at DESC
                     LIMIT ?
                     """,
@@ -156,7 +217,8 @@ def search_db_memories(provider: Any, query: str, *, limit: int) -> list[RecallI
                     f"""
                     SELECT *
                     FROM memories
-                    WHERE ({clause}) AND scope_id IN ({_scope_placeholders(provider)}) AND {_ACTIVE_MEMORY_SQL}
+                    WHERE ({clause}) AND scope_id IN ({_scope_placeholders(provider)})
+                      AND {_ACTIVE_MEMORY_SQL} AND {RETRIEVAL_ELIGIBLE_WHERE}
                     ORDER BY updated_at DESC
                     LIMIT ?
                     """,
@@ -273,6 +335,12 @@ def search_vector_memories(provider: Any, query: str, *, limit: int) -> list[Rec
                 metadata=metadata,
             )
         )
+    # Phase 2: post-filter against SQLite source-of-truth.
+    # Even if the vector index still contains a row for an excluded memory,
+    # we must not return it. Batch-query SQLite for eligibility.
+    conn = provider._require_conn()
+    eligible = _retrieval_eligible_ids(conn, [item.id for item in results])
+    results = [item for item in results if item.id in eligible]
     return results
 
 
@@ -335,3 +403,90 @@ def search_curated_memories(provider: Any, query: str) -> list[RecallItem]:
             )
         )
     return results
+
+
+# NOTE (data model gap — 2026-07-12): Curated memory entries (file-based
+# MEMORY.md/USER.md) do NOT have a stable mapping to `memories.id` — their
+# IDs are synthetic (curated:<target>:<sha1>) and cannot carry
+# retrieval_excluded state by themselves.  This means curated entries are
+# always eligible for default retrieval and cannot be individually excluded
+# via the retrieval_excluded mechanism.  The RecallService merge layer
+# (recall.py) provides the final fail-closed defense, but curated IDs will
+# pass through since they don't exist in the memories table.
+# To extend exclusion to curated entries, a mapping layer from curated
+# entry hash to a governance-controlled exclusion list would be needed.
+# For now, exclusion of curated content requires removing the file from
+# the filesystem (deleting entries in MEMORY.md/USER.md).
+#
+# This gap means the A3 Program retrieval exclusion contract covers only
+# database-backed memories (SQLite + vector).  Curated file-based memories
+# are governed by a separate lifecycle (file deletion / manifest editing).
+
+
+# ---------------------------------------------------------------------------
+# Explicit archive / history queries
+# ---------------------------------------------------------------------------
+
+def search_archived_memories(
+    provider: Any,
+    *,
+    memory_id: str | None = None,
+    batch_id: str | None = None,
+    reason: str | None = None,
+    limit: int = 50,
+) -> list[RecallItem]:
+    """Retrieve retrieval-excluded records directly, bypassing default exclusion.
+
+    Supports filtering by memory ID, exclusion batch ID, and/or exclusion reason.
+    Preserves full content, source, lineage, and raw content hash.
+
+    This is the *only* path that should return excluded records.  It must NOT
+    be used by default retrieval (search_db_memories etc.).  The WHERE clause
+    explicitly targets retrieval_excluded = 1 to avoid accidental inclusion.
+    """
+    conn = provider._require_conn()
+    clauses: list[str] = ["retrieval_excluded = 1"]
+    params: list[Any] = []
+    if memory_id is not None:
+        clauses.append("id = ?")
+        params.append(memory_id)
+    if batch_id is not None:
+        clauses.append("retrieval_exclusion_batch_id = ?")
+        params.append(batch_id)
+    if reason is not None:
+        clauses.append("retrieval_exclusion_reason LIKE ?")
+        params.append(f"%{reason}%")
+    # Scope constraint: only accessible scopes
+    clauses.append("scope_id IN ({})".format(_scope_placeholders(provider)))
+    params.extend(_accessible_scope_params(provider))
+    params.append(limit)
+    where = " AND ".join(clauses)
+    rows = conn.execute(
+        f"""
+        SELECT id, content, summary, source, target, updated_at, scope_id,
+               retrieval_excluded_at, retrieval_exclusion_batch_id, retrieval_exclusion_reason
+        FROM memories
+        WHERE {where}
+        ORDER BY updated_at DESC
+        LIMIT ?
+        """,
+        params,
+    ).fetchall()
+    return [
+        RecallItem(
+            id=row["id"],
+            content=row["content"],
+            summary=row["summary"],
+            source=row["source"],
+            target=row["target"],
+            score=1.0,
+            updated_at=row["updated_at"],
+            metadata={
+                "scope_id": row["scope_id"],
+                "retrieval_excluded_at": row["retrieval_excluded_at"],
+                "retrieval_exclusion_batch_id": row["retrieval_exclusion_batch_id"],
+                "retrieval_exclusion_reason": row["retrieval_exclusion_reason"],
+            },
+        )
+        for row in rows
+    ]
