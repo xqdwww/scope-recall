@@ -46,13 +46,6 @@ class BenchmarkProvider:
         self._conn = sqlite3.connect(":memory:")
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("CREATE TABLE memories(id TEXT PRIMARY KEY, scope_id TEXT NOT NULL, metadata TEXT NOT NULL DEFAULT '{}')")
-        # Ensure retrieval_excluded column exists
-        existing = {row[1] for row in self._conn.execute("PRAGMA table_info(memories)").fetchall()}
-        if "retrieval_excluded" not in existing:
-            self._conn.execute("ALTER TABLE memories ADD COLUMN retrieval_excluded INTEGER NOT NULL DEFAULT 0")
-            self._conn.execute("ALTER TABLE memories ADD COLUMN retrieval_excluded_at TEXT")
-            self._conn.execute("ALTER TABLE memories ADD COLUMN retrieval_exclusion_batch_id TEXT")
-            self._conn.execute("ALTER TABLE memories ADD COLUMN retrieval_exclusion_reason TEXT")
         ensure_graph_schema(self._conn)
         for item in self._items:
             scope_id = str((item.metadata or {}).get("scope_id") or self._shared_scope_id)
