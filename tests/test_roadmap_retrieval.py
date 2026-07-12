@@ -17,6 +17,26 @@ class DummyProvider:
         self._accessible_scope_ids = [self._scope_id, self._shared_scope_id]
         self._db_items = list(db_items or [])
         self._vector_items = list(vector_items or [])
+        import sqlite3
+        from scope_recall.sql_store import ensure_schema
+        self._conn = sqlite3.connect(":memory:")
+        self._conn.row_factory = sqlite3.Row
+        ensure_schema(self._conn)
+        self._insert_test_items()
+
+    def _insert_test_items(self):
+        """Insert db_items into the in-memory DB so _filter_eligible can verify them."""
+        for item in self._db_items:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO memories (id, scope_id, content, summary, source, target, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, '2026-06-01T00:00:00Z', '2026-06-01T00:00:00Z')",
+                (item.id, getattr(item, 'scope_id', self._shared_scope_id),
+                 item.content, item.summary, item.source, item.target),
+            )
+        self._conn.commit()
+
+    def _require_conn(self):
+        return self._conn
 
     def _search_db_memories(self, query, *, limit):
         return self._db_items[:limit]

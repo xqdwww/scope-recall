@@ -650,21 +650,40 @@ def test_merge_layer_curated_empty_id_not_rejected():
 
 
 def test_merge_layer_null_id_rejected():
-    """Items with None ID must not crash the merge pipeline.
+    """Items with None ID are dropped at the input boundary before merge.
 
-    Items with ``id=None`` crash in ``merge_recall_candidates()`` (upstream
-    ``recall_pipeline.py:recall_dedup_key`` attempts ``item.id.startswith``).
-    This test verifies that such items do not crash the service, and that
-    ``_filter_eligible`` handles the downstream compatibility scenario
-    where the retrieval_excluded column is missing from the schema.
+    The upstream merge_recall_candidates crashes on None IDs
+    (recall_dedup_key attempts item.id.startswith).  The search_memories
+    pipeline now defensively filters them out before the merge step.
     """
-    null_item = _make_item("none-id-test", content="Null-equivalent candidate.")  # type: ignore[arg-type]
-    provider = FailingProvider(db_items=[null_item])
-    service = RecallService(provider)
-    results = service.search_memories("none", limit=5)
-    # With missing retrieval_excluded column, the compatibility fallback
-    # passes all items through as eligible.
-    assert results is not None
+    conn = _conn()
+    provider = FakeProvider(conn)
+
+    # Insert a legitimate item that the real search can find
+    _store(conn, memory_id='test-normal', content='Should still be found test.')
+
+    # Create a None-ID item that cannot be in the DB
+    null_unsafe_item = _make_item(None, content='Null ID candidate.')
+
+    # Monkey-patch _search_db_memories to return both items
+    original = provider.__class__._search_db_memories
+    provider.__class__._search_db_memories = lambda self, q, *, limit: [
+        null_unsafe_item,
+    ]
+    original_vector = provider.__class__._search_vector_memories
+    provider.__class__._search_vector_memories = lambda self, q, *, limit: []
+    original_curated = provider.__class__._search_curated_memories
+    provider.__class__._search_curated_memories = lambda self, q: []
+    try:
+        service = RecallService(provider)
+        # Must NOT crash despite the None-ID item
+        results = service.search_memories('test', limit=5)
+        ids = {item.id for item in results}
+        assert None not in ids, "None-ID item leaked into results"
+    finally:
+        provider.__class__._search_db_memories = original
+        provider.__class__._search_vector_memories = original_vector
+        provider.__class__._search_curated_memories = original_curated
 
 
 def test_merge_layer_excluded_injected_still_caught():

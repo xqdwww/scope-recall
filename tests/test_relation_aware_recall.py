@@ -32,6 +32,13 @@ class DummyProvider:
         self._conn = sqlite3.connect(":memory:")
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("CREATE TABLE IF NOT EXISTS memories (id TEXT PRIMARY KEY, scope_id TEXT NOT NULL DEFAULT '', metadata TEXT NOT NULL DEFAULT '{}')")
+        # Ensure retrieval_excluded column exists (minimal — no full migration)
+        existing = {row[1] for row in self._conn.execute("PRAGMA table_info(memories)").fetchall()}
+        if "retrieval_excluded" not in existing:
+            self._conn.execute("ALTER TABLE memories ADD COLUMN retrieval_excluded INTEGER NOT NULL DEFAULT 0")
+            self._conn.execute("ALTER TABLE memories ADD COLUMN retrieval_excluded_at TEXT")
+            self._conn.execute("ALTER TABLE memories ADD COLUMN retrieval_exclusion_batch_id TEXT")
+            self._conn.execute("ALTER TABLE memories ADD COLUMN retrieval_exclusion_reason TEXT")
         for item in self._items:
             self._conn.execute(
                 "INSERT OR REPLACE INTO memories(id, scope_id, metadata) VALUES (?, ?, ?)",

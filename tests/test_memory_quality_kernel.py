@@ -52,6 +52,9 @@ class DummyProvider:
             )
         self._conn.commit()
 
+    def _require_conn(self):
+        return self._conn
+
     def _search_db_memories(self, query: str, *, limit: int) -> list[RecallItem]:
         return self._items[:limit]
 
