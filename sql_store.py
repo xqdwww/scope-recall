@@ -17,6 +17,7 @@ from .gating import compact_text, dedup_key
 from .governance import classify_memory, merge_metadata
 from .graph import backfill_memory_entities, ensure_graph_schema, sync_memory_entities
 from .memory_quality import HIDDEN_PROFILE_LIFECYCLES
+from .telemetry import ensure_retrieval_telemetry_schema
 
 ENTRY_DELIMITER = "\n§\n"
 SCHEMA_VERSION = 10600
@@ -191,6 +192,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     ensure_schema_migrations(conn)
     rebuild_fts_if_empty(conn)
     backfill_memory_entities(conn)
+    ensure_retrieval_telemetry_schema(conn)
     conn.commit()
 
 

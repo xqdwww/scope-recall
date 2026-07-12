@@ -13,6 +13,7 @@ from .graph import load_metadata
 from .models import RecallItem
 from .scoring import bm25_to_score, lexical_score
 from .sql_store import curated_recall_item_id, iter_curated_entries
+from .telemetry import record_candidate_events
 from .vector_runtime import mark_vector_needs_repair
 
 # Defensive retrieval boundary: lifecycle filtering must happen in the candidate
@@ -150,6 +151,13 @@ def _alias_like_terms(query: str, tokens: list[str]) -> list[str]:
             if len(terms) >= 12:
                 return terms
     return terms
+
+
+def _telemetry_request_id(provider: Any) -> str:
+    """Generate a stable request_id for the current recall turn."""
+    sid = str(getattr(provider, "_session_id", "") or "")
+    turn = int(getattr(provider, "_current_turn", 0) or 0)
+    return f"recall-{sid}-{turn}" if sid else f"recall-{turn}"
 
 
 def _row_metadata(
@@ -292,6 +300,13 @@ def search_db_memories(provider: Any, query: str, *, limit: int) -> list[RecallI
         )
         if results[-1].metadata is not None and str(row["id"]) in bm25_raw_scores:
             results[-1].metadata["bm25_raw"] = bm25_raw_scores[str(row["id"])]
+    record_candidate_events(
+        provider,
+        request_id=_telemetry_request_id(provider),
+        query=query,
+        items=[{"id": r.id, "score": r.score, "scope_id": None, "session_id": None, "turn_id": None} for r in results],
+        retrieval_path="fts",
+    )
     return results
 
 
@@ -360,6 +375,13 @@ def search_vector_memories(provider: Any, query: str, *, limit: int) -> list[Rec
     conn = provider._require_conn()
     eligible = _retrieval_eligible_ids(conn, [item.id for item in results])
     results = [item for item in results if item.id in eligible]
+    record_candidate_events(
+        provider,
+        request_id=_telemetry_request_id(provider),
+        query=query,
+        items=[{"id": r.id, "score": r.score, "scope_id": None, "session_id": None, "turn_id": None} for r in results],
+        retrieval_path="vector",
+    )
     return results
 
 
@@ -421,6 +443,13 @@ def search_curated_memories(provider: Any, query: str) -> list[RecallItem]:
                 metadata=metadata,
             )
         )
+    record_candidate_events(
+        provider,
+        request_id=_telemetry_request_id(provider),
+        query=query,
+        items=[{"id": r.id, "score": r.score, "scope_id": None, "session_id": None, "turn_id": None} for r in results],
+        retrieval_path="curated",
+    )
     return results
 
 

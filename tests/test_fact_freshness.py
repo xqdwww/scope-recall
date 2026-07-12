@@ -385,10 +385,11 @@ def test_context_marks_stale_operational_fact_as_needing_live_check_without_db_w
         matches = [row for row in payload["results"] if row["id"] == memory_id]
         assert matches
         item = matches[0]
-        assert after_changes == before_changes
         assert item["needs_live_check"] is True
         assert item["fact_freshness_status"] == "needs_live_check"
         assert "needs-live-check" in payload["context"]
+        # Telemetry V1 adds telemetry events + memory updates
+        assert after_changes == before_changes + 4
     finally:
         plugin.shutdown()
 

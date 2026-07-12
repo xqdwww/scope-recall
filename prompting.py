@@ -4,10 +4,13 @@ Rendering must be compact and deterministic because it directly affects the agen
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from .gating import compact_text, config_bool, should_skip_retrieval
 from .models import RecallItem
+
+_logger = logging.getLogger(__name__)
 
 
 def render_current_turn_recall(provider: Any, query: str) -> str:
@@ -30,6 +33,20 @@ def render_current_turn_recall(provider: Any, query: str) -> str:
         return ""
 
     provider._mark_recalled([item.id for item in selected])
+    # Record injected-stage telemetry
+    from .telemetry import record_injected_events  # noqa: E402
+    try:
+        sid = str(getattr(provider, "_session_id", "") or "")
+        turn = str(getattr(provider, "_current_turn", "") or "")
+        req_id = f"recall-{sid}-{turn}" if sid else f"recall-{turn}"
+        record_injected_events(
+            provider,
+            request_id=req_id,
+            query=query,
+            items=[{"id": r.id, "score": r.score, "turn_id": turn} for r in selected],
+        )
+    except Exception:
+        _logger.debug("Telemetry injected-event recording skipped", exc_info=True)
     lines = [f"- [{item.target or item.source}] {item.summary}" for item in selected]
     return "## Scope Recall Relevant Memories\n" + "\n".join(lines)
 

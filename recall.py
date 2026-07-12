@@ -335,6 +335,20 @@ class RecallService:
         trace["final"] = final_trace_payload(returned=returned, ranked_rejected=ranked_rejected)
         trace["timings_ms"]["total"] = self._elapsed_ms(started_at)
         self.last_funnel_trace = trace
+        # Record selected-stage telemetry
+        from .telemetry import record_selected_events  # noqa: E402
+        try:
+            sid = str(getattr(self.provider, "_session_id", "") or "")
+            turn = int(getattr(self.provider, "_current_turn", 0) or 0)
+            req_id = f"recall-{sid}-{turn}" if sid else f"recall-{turn}"
+            record_selected_events(
+                self.provider,
+                request_id=req_id,
+                query=query,
+                items=[{"id": r.id, "score": r.score, "scope_id": None, "session_id": None, "turn_id": None} for r in returned],
+            )
+        except Exception:
+            _logger.debug("Telemetry selected-event recording skipped", exc_info=True)
         return returned
 
     @staticmethod

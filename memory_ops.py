@@ -1029,6 +1029,20 @@ def context_payload(provider: Any, *, query: str, limit: int = 5, max_chars: int
                 "fact_freshness_penalty": metadata.get("fact_freshness_penalty", 0.0),
             }
         )
+    # Record injected-stage telemetry
+    from .telemetry import record_injected_events  # noqa: E402
+    try:
+        sid = str(getattr(provider, "_session_id", "") or "")
+        turn = str(getattr(provider, "_current_turn", "") or "")
+        req_id = f"context-{sid}-{turn}" if sid else f"context-{turn}"
+        record_injected_events(
+            provider,
+            request_id=req_id,
+            query=query,
+            items=[{"id": r.id, "score": r.score, "turn_id": turn} for r in results],
+        )
+    except Exception:
+        logger.debug("Telemetry context-injection event skipped", exc_info=True)
     top_entities = [
         {"entity": entity, "count": count}
         for entity, count in sorted(entity_counts.items(), key=lambda pair: (-pair[1], pair[0]))[:10]
