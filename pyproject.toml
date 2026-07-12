@@ -137,6 +137,7 @@ include = [
   "nightly_llm.py",
   "provider_schemas.py",
   "pgvector_store.py",
+  "prospective_governance.py",
   "postgres_bridge.py",
   "recall.py",
   "recall_pipeline.py",
