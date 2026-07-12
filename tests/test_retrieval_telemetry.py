@@ -234,23 +234,14 @@ def test_8_retry_idempotent_hit_count():
             items=[{"id": "mem8", "score": 0.9, "turn_id": "42"}]
         )
 
-    # INSERT OR IGNORE means only 1 event row
+    # INSERT OR IGNORE means only 1 event row and aggregate update is tied to it.
     cnt = conn.execute(
         "SELECT COUNT(*) FROM retrieval_events WHERE request_id='r8' AND stage='injected'"
     ).fetchone()[0]
     assert cnt == 1
 
-    # hit_count increments only once per unique (request_id, memory_id, stage) combo
-    # But the idempotency check is on event_id, not on the memories update.
-    # The memories UPDATE is NOT idempotent by design (each call adds +1).
-    # Test: hit_count should be 2 because we called injected twice.
-    # This is correct — the retry guard is on the event table, not the memory fields.
-    # The memory fields can be updated multiple times for the same request because
-    # injected events are the only true "use" signal and subsequent retries
-    # represent actual re-use.
-    # Let's verify: hit_count >= 1 (at least one) 
     hc = conn.execute("SELECT hit_count FROM memories WHERE id='mem8'").fetchone()[0]
-    assert hc >= 1
+    assert hc == 1
 
 
 # ===========================================================================
@@ -309,25 +300,18 @@ def test_11_excluded_no_selected_or_injected():
     conn.execute("INSERT INTO memories (id, scope_id, platform, user_id, source, target, content, summary, created_at, updated_at, retrieval_excluded, dedup_key, metadata) VALUES ('excl1', 'local', 'test', 'u', 'test', 'ops', 'x', 'x', '2026-01-01', '2026-01-01', 1, 'hash', '{}')")
     conn.commit()
 
-    # selected should still be recorded for telemetry completeness
-    # (the exclusion happens upstream — telemetry records what was sent to it)
     record_selected_events(
         prov, request_id="r11", query="t",
         items=[{"id": "excl1"}]
     )
-    assert conn.execute("SELECT COUNT(*) FROM retrieval_events WHERE request_id='r11' AND stage='selected'").fetchone()[0] == 1
+    assert conn.execute("SELECT COUNT(*) FROM retrieval_events WHERE request_id='r11' AND stage='selected'").fetchone()[0] == 0
 
-    # But injected should NOT be recorded because excluded memories should not reach injection
-    # However, the telemetry module doesn't enforce this — it records what it's given.
-    # The enforcement is in the retrieval pipeline (storage_views.py / recall.py).
-    # Test: the telemetry module correctly records what is passed to it.
     record_injected_events(
         prov, request_id="r11", query="t",
         items=[{"id": "excl1", "score": 0.5, "turn_id": "1"}]
     )
-    # hit_count should still be 0 because the pipeline never sends excluded memories to injection
-    # But test: if it were sent, telemetry would record it. The guard is upstream.
-    assert conn.execute("SELECT hit_count FROM memories WHERE id='excl1'").fetchone()[0] >= 0
+    assert conn.execute("SELECT COUNT(*) FROM retrieval_events WHERE request_id='r11' AND stage='injected'").fetchone()[0] == 0
+    assert conn.execute("SELECT hit_count FROM memories WHERE id='excl1'").fetchone()[0] == 0
 
 
 # ===========================================================================
@@ -341,9 +325,10 @@ def test_12_historical_only_no_default_injected():
     ensure_retrieval_telemetry_schema(conn)
 
     _memory_row(conn, "hist1")
-    # retrieval_policy is stored in metadata JSON
-    meta = json.dumps({"retrieval_policy": "historical_only", "freshness": "historical"}, sort_keys=True)
-    conn.execute("UPDATE memories SET metadata = ? WHERE id='hist1'", (meta,))
+    conn.execute(
+        "UPDATE memories SET metadata = ? WHERE id='hist1'",
+        (json.dumps({"retrieval_policy": "historical_only"}),),
+    )
     conn.commit()
 
     # candidate is fine
@@ -353,14 +338,15 @@ def test_12_historical_only_no_default_injected():
     )
     assert conn.execute("SELECT COUNT(*) FROM retrieval_events WHERE request_id='r12' AND stage='candidate'").fetchone()[0] == 1
 
-    # selected from explicit query is fine  
     record_selected_events(
         prov, request_id="r12", query="t", items=[{"id": "hist1"}]
     )
-    assert conn.execute("SELECT COUNT(*) FROM retrieval_events WHERE request_id='r12' AND stage='selected'").fetchone()[0] == 1
-
-    # injected is not recorded by default — the pipeline filters it out
-    # Test: telemetry correctly handles only what it receives
+    record_injected_events(
+        prov, request_id="r12", query="t",
+        items=[{"id": "hist1", "turn_id": "1"}]
+    )
+    assert conn.execute("SELECT COUNT(*) FROM retrieval_events WHERE request_id='r12' AND stage IN ('selected','injected')").fetchone()[0] == 0
+    assert conn.execute("SELECT hit_count FROM memories WHERE id='hist1'").fetchone()[0] == 0
 
 
 # ===========================================================================
@@ -563,3 +549,48 @@ def test_20_health_report():
     assert report["database_memories_ever_injected_since_start"] >= 1
     assert report["records_with_hit_count_gt_0"] >= 1
     assert report["records_with_last_retrieved_at"] >= 1
+
+
+def test_21_candidate_paths_have_distinct_idempotency_keys():
+    conn = _conn()
+    prov = FakeTelemetryProvider(conn)
+    _memory_row(conn, "mem21")
+    for path in ("fts", "like", "alias"):
+        record_candidate_events(
+            prov, request_id="r21", query="same", items=[{"id": "mem21"}],
+            retrieval_path=path,
+        )
+    rows = conn.execute(
+        "SELECT retrieval_path FROM retrieval_events WHERE request_id='r21' ORDER BY retrieval_path"
+    ).fetchall()
+    assert [row[0] for row in rows] == ["alias", "fts", "like"]
+
+
+def test_22_injected_event_and_aggregate_are_atomic_on_failure():
+    conn = _conn()
+    prov = FakeTelemetryProvider(conn)
+    _memory_row(conn, "mem22")
+    conn.execute(
+        """CREATE TRIGGER fail_mem22_update BEFORE UPDATE OF hit_count ON memories
+           WHEN OLD.id='mem22' BEGIN SELECT RAISE(ABORT, 'aggregate failure'); END"""
+    )
+    conn.commit()
+    assert record_injected_events(
+        prov, request_id="r22", query="atomic", items=[{"id": "mem22", "turn_id": "2"}]
+    ) == 0
+    assert conn.execute("SELECT count(*) FROM retrieval_events WHERE request_id='r22'").fetchone()[0] == 0
+    assert conn.execute("SELECT hit_count FROM memories WHERE id='mem22'").fetchone()[0] == 0
+    health = retrieval_telemetry_health(prov)
+    assert health["telemetry_write_failures"] == 1
+    assert health["coverage_complete"] is False
+
+
+def test_23_old_schema_migration_is_idempotent_and_preserves_rows():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute("CREATE TABLE memories(id TEXT PRIMARY KEY, content TEXT NOT NULL)")
+    conn.execute("INSERT INTO memories VALUES('old1', 'unchanged body')")
+    assert ensure_retrieval_telemetry_schema(conn) is True
+    assert ensure_retrieval_telemetry_schema(conn) is False
+    assert conn.execute("SELECT content FROM memories WHERE id='old1'").fetchone()[0] == "unchanged body"
+    assert conn.execute("SELECT count(*) FROM retrieval_events").fetchone()[0] == 0

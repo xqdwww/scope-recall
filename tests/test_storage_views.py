@@ -110,6 +110,14 @@ def test_search_db_memories_finds_alias_expanded_lexical_hits_without_recent_bac
     results = search_db_memories(provider, "response style", limit=5)
 
     assert [item.id for item in results] == ["user-reply-style"]
+    paths = {
+        row[0]
+        for row in conn.execute(
+            "SELECT retrieval_path FROM retrieval_events WHERE stage='candidate'"
+        ).fetchall()
+    }
+    assert "alias" in paths
+    assert paths <= {"fts", "like", "alias"}
 
 
 def test_fts_candidates_use_bm25_before_recency_cutoff():

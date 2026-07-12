@@ -189,6 +189,7 @@ def search_db_memories(provider: Any, query: str, *, limit: int) -> list[RecallI
     tokens = query_tokens(query)
     fts_query = build_fts_query(tokens)
     rows: list[sqlite3.Row] = []
+    path_rows: dict[str, list[sqlite3.Row]] = {"fts": [], "like": [], "alias": []}
     try:
         configured_pool = int((provider._retrieval_config or {}).get("candidate_pool") or 0)
     except (TypeError, ValueError):
@@ -196,8 +197,7 @@ def search_db_memories(provider: Any, query: str, *, limit: int) -> list[RecallI
     candidate_pool = max(limit * 2, limit, configured_pool)
     with provider._lock:
         if fts_query:
-            rows.extend(
-                conn.execute(
+            path_rows["fts"] = conn.execute(
                     f"""
                     SELECT m.*, bm25(memories_fts) AS bm25_score
                     FROM memories_fts
@@ -209,7 +209,7 @@ def search_db_memories(provider: Any, query: str, *, limit: int) -> list[RecallI
                     """,
                     [fts_query, *_accessible_scope_params(provider), candidate_pool],
                 ).fetchall()
-            )
+            rows.extend(path_rows["fts"])
         like_query_terms = like_terms(query, tokens)
         if like_query_terms:
             clause = " OR ".join(["content LIKE ?", "summary LIKE ?"] * len(like_query_terms))
@@ -218,8 +218,7 @@ def search_db_memories(provider: Any, query: str, *, limit: int) -> list[RecallI
                 needle = f"%{term}%"
                 params.extend([needle, needle])
             params.extend([*_accessible_scope_params(provider), candidate_pool])
-            rows.extend(
-                conn.execute(
+            path_rows["like"] = conn.execute(
                     f"""
                     SELECT *
                     FROM memories
@@ -230,7 +229,7 @@ def search_db_memories(provider: Any, query: str, *, limit: int) -> list[RecallI
                     """,
                     params,
                 ).fetchall()
-            )
+            rows.extend(path_rows["like"])
         alias_terms = _alias_like_terms(query, tokens)
         if alias_terms:
             clause = " OR ".join(["content LIKE ?", "summary LIKE ?"] * len(alias_terms))
@@ -239,8 +238,7 @@ def search_db_memories(provider: Any, query: str, *, limit: int) -> list[RecallI
                 needle = f"%{term}%"
                 params.extend([needle, needle])
             params.extend([*_accessible_scope_params(provider), candidate_pool])
-            rows.extend(
-                conn.execute(
+            path_rows["alias"] = conn.execute(
                     f"""
                     SELECT *
                     FROM memories
@@ -251,7 +249,7 @@ def search_db_memories(provider: Any, query: str, *, limit: int) -> list[RecallI
                     """,
                     params,
                 ).fetchall()
-            )
+            rows.extend(path_rows["alias"])
         # Do not backfill retrieval with arbitrary recent memories.
         # Earlier versions scanned newest rows when lexical LIKE/FTS returned too
         # few candidates, then accepted durable/tool rows on source/target bonus
@@ -300,13 +298,15 @@ def search_db_memories(provider: Any, query: str, *, limit: int) -> list[RecallI
         )
         if results[-1].metadata is not None and str(row["id"]) in bm25_raw_scores:
             results[-1].metadata["bm25_raw"] = bm25_raw_scores[str(row["id"])]
-    record_candidate_events(
-        provider,
-        request_id=_telemetry_request_id(provider),
-        query=query,
-        items=[{"id": r.id, "score": r.score, "scope_id": None, "session_id": None, "turn_id": None} for r in results],
-        retrieval_path="fts",
-    )
+    request_id = _telemetry_request_id(provider)
+    for retrieval_path, candidate_rows in path_rows.items():
+        record_candidate_events(
+            provider,
+            request_id=request_id,
+            query=query,
+            items=[{"id": str(row["id"])} for row in candidate_rows],
+            retrieval_path=retrieval_path,
+        )
     return results
 
 

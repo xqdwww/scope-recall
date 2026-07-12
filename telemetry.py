@@ -74,10 +74,14 @@ def _now_iso() -> str:
 
 
 def _telemetry_event_id(
-    request_id: str, memory_id: str, stage: str, seq: int = 0
+    request_id: str, memory_id: str, stage: str, seq: int = 0, discriminator: str = ""
 ) -> str:
     """Deterministic event ID for idempotent inserts."""
-    raw = f"{request_id}|{memory_id}|{stage}:{seq}"
+    raw = (
+        f"{request_id}|{memory_id}|{stage}|{discriminator}:{seq}"
+        if discriminator
+        else f"{request_id}|{memory_id}|{stage}:{seq}"
+    )
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:40]
 
 
@@ -260,7 +264,7 @@ def record_candidate_events(
         domain = "curated" if mid.startswith("curated:") else "database"
         events.append(
             RetrievalEvent(
-                event_id=_telemetry_event_id(request_id, mid, "candidate", rank),
+                event_id=_telemetry_event_id(request_id, mid, "candidate", rank, retrieval_path),
                 request_id=request_id,
                 memory_id=mid,
                 memory_domain=domain,
@@ -294,6 +298,7 @@ def record_selected_events(
 
     Returns the number of new rows inserted.
     """
+    items = _eligible_final_stage_items(provider, items, conn=conn)
     if not items:
         return 0
     qh = _query_hash(query)
@@ -344,6 +349,7 @@ def record_injected_events(
 
     Returns the number of new rows inserted.
     """
+    items = _eligible_final_stage_items(provider, items, conn=conn)
     if not items:
         return 0
     qh = _query_hash(query)
@@ -380,45 +386,143 @@ def record_injected_events(
             turn = max(0, int(item.get("turn_id") or 0) or int(item.get("last_recalled_turn") or 0))
             db_updates.append((turn, now, mid))
 
-    inserted = _write_events(provider, events, conn=conn)
+    return _write_injected_transaction(provider, events, db_updates, conn=conn)
 
-    # Update memory aggregate fields within the same lock scope
+
+def _eligible_final_stage_items(
+    provider: Any,
+    items: list[dict[str, Any]],
+    *,
+    conn: sqlite3.Connection | None = None,
+) -> list[dict[str, Any]]:
+    """Fail closed for DB-backed selected/injected events.
+
+    Curated IDs are file-backed and pass without touching ``memories``. Database
+    IDs must still be retrieval eligible at the exact final-stage write point.
+    """
+    curated = [item for item in items if str(item.get("id") or "").startswith("curated:")]
+    database = [item for item in items if item not in curated and str(item.get("id") or "")]
+    if not database:
+        return curated
+    local_conn = conn or getattr(provider, "_conn", None)
+    if local_conn is None:
+        return curated
+    ids = [str(item["id"]) for item in database]
+    try:
+        columns = {str(row[1]) for row in local_conn.execute("PRAGMA table_info(memories)")}
+        policy_clause = (
+            "AND COALESCE(retrieval_policy, 'normal') != 'historical_only'"
+            if "retrieval_policy" in columns
+            else "AND COALESCE(json_extract(metadata, '$.retrieval_policy'), 'normal') != 'historical_only'"
+        )
+        rows = local_conn.execute(
+            f"""SELECT id FROM memories
+                WHERE id IN ({','.join('?' for _ in ids)})
+                  AND retrieval_excluded = 0
+                  {policy_clause}""",
+            ids,
+        ).fetchall()
+        eligible = {str(row[0]) for row in rows}
+    except Exception:
+        return curated
+    return curated + [item for item in database if str(item["id"]) in eligible]
+
+
+def _write_injected_transaction(
+    provider: Any,
+    events: list[RetrievalEvent],
+    db_updates: list[tuple[int, str, str]],
+    *,
+    conn: sqlite3.Connection | None = None,
+) -> int:
+    """Atomically append injected events and update aggregates for new events only."""
     local_conn = conn
-    acquired_lock = False
-    if local_conn is None and hasattr(provider, "_lock") and hasattr(provider, "_conn"):
-        provider._lock.acquire()  # type: ignore[union-attr]
-        acquired_lock = True
-        try:
-            local_conn = provider._conn  # type: ignore[union-attr]
-        except Exception:
-            pass
+    lock = getattr(provider, "_lock", None)
+    acquired = False
+    try:
+        if local_conn is None:
+            local_conn = getattr(provider, "_conn", None)
+        if local_conn is None:
+            _logger.warning("Telemetry: no connection available, dropping injected events")
+            return 0
+        if lock is not None:
+            lock.acquire()
+            acquired = True
 
-    if local_conn is not None and db_updates:
-        try:
-            for turn, retrieved_at, mid in db_updates:
-                local_conn.execute(
-                    """
-                    UPDATE memories
-                    SET hit_count = hit_count + 1,
-                        last_recalled_turn = MAX(last_recalled_turn, ?),
-                        last_retrieved_at = MAX(COALESCE(last_retrieved_at, ''), ?)
-                    WHERE id = ?
-                    """,
-                    (turn, retrieved_at, mid),
+        local_conn.execute("SAVEPOINT retrieval_telemetry_injected")
+        inserted_events: list[RetrievalEvent] = []
+        for event in events:
+            before = local_conn.total_changes
+            _batch_insert_events(local_conn, [event])
+            if local_conn.total_changes > before:
+                inserted_events.append(event)
+
+        updates = {mid: (turn, retrieved_at) for turn, retrieved_at, mid in db_updates}
+        columns = {str(row[1]) for row in local_conn.execute("PRAGMA table_info(memories)")}
+        policy_clause = (
+            "AND COALESCE(retrieval_policy, 'normal') != 'historical_only'"
+            if "retrieval_policy" in columns
+            else "AND COALESCE(json_extract(metadata, '$.retrieval_policy'), 'normal') != 'historical_only'"
+        )
+        for event in inserted_events:
+            mid = event.memory_id
+            if mid not in updates:
+                continue
+            turn, retrieved_at = updates[mid]
+            cursor = local_conn.execute(
+                f"""
+                UPDATE memories
+                SET hit_count = hit_count + 1,
+                    last_recalled_turn = MAX(last_recalled_turn, ?),
+                    last_retrieved_at = MAX(COALESCE(last_retrieved_at, ''), ?)
+                WHERE id = ? AND retrieval_excluded = 0
+                  {policy_clause}
+                """,
+                (turn, retrieved_at, mid),
+            )
+            if cursor.rowcount != 1:
+                raise sqlite3.IntegrityError(
+                    f"injected aggregate eligibility changed for {mid}"
                 )
-            local_conn.commit()
-        except Exception as exc:
-            _logger.error("Telemetry memory-update failure: %s", exc)
-            local_conn.rollback()
-            # Do NOT re-raise — telemetry failure must not block retrieval.
+        local_conn.execute("RELEASE SAVEPOINT retrieval_telemetry_injected")
+        return len(inserted_events)
+    except Exception as exc:
+        _logger.error("Telemetry injected transaction failure: %s", exc)
+        if local_conn is not None:
+            try:
+                local_conn.execute("ROLLBACK TO SAVEPOINT retrieval_telemetry_injected")
+                local_conn.execute("RELEASE SAVEPOINT retrieval_telemetry_injected")
+            except Exception:
+                pass
+            _mark_coverage_incomplete(local_conn, "injected_transaction_failure")
+        return 0
+    finally:
+        if acquired:
+            lock.release()
 
-    if acquired_lock:
+
+def _mark_coverage_incomplete(conn: sqlite3.Connection, reason: str) -> None:
+    """Best-effort persistent failure marker; never raises into retrieval."""
+    try:
+        conn.execute(
+            """INSERT INTO retrieval_telemetry_config(key, value) VALUES('telemetry_write_failures', '1')
+               ON CONFLICT(key) DO UPDATE SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT)"""
+        )
+        conn.execute(
+            """INSERT INTO retrieval_telemetry_config(key, value) VALUES('telemetry_coverage_status', 'incomplete')
+               ON CONFLICT(key) DO UPDATE SET value='incomplete'"""
+        )
+        conn.execute(
+            """INSERT INTO retrieval_telemetry_config(key, value) VALUES('telemetry_last_failure_reason', ?)
+               ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+            (reason,),
+        )
+        conn.commit()
+    except Exception:
         try:
-            provider._lock.release()  # type: ignore[union-attr]
+            conn.rollback()
         except Exception:
             pass
-
-    return inserted
 
 
 def _write_events(
@@ -444,9 +548,19 @@ def _write_events(
             _logger.warning("Telemetry: no connection available, dropping %d events", len(events))
             return 0
 
-        return _batch_insert_events(local_conn, events)
+        local_conn.execute("SAVEPOINT retrieval_telemetry_events")
+        inserted = _batch_insert_events(local_conn, events)
+        local_conn.execute("RELEASE SAVEPOINT retrieval_telemetry_events")
+        return inserted
     except Exception as exc:
         _logger.error("Telemetry write failure (%d events): %s", len(events), exc)
+        if local_conn is not None:
+            try:
+                local_conn.execute("ROLLBACK TO SAVEPOINT retrieval_telemetry_events")
+                local_conn.execute("RELEASE SAVEPOINT retrieval_telemetry_events")
+            except Exception:
+                pass
+            _mark_coverage_incomplete(local_conn, "event_write_failure")
         return 0
     finally:
         if acquired_lock:
@@ -605,6 +719,7 @@ def retrieval_telemetry_health(provider: Any) -> dict[str, Any]:
         "requests_with_complete_selected_coverage": complete_selected,
         "requests_with_complete_injected_coverage": complete_injected,
         "telemetry_write_failures": write_failures,
+        "coverage_complete": write_failures == 0,
         "database_memories_ever_injected_since_start": databases_injected,
         "curated_items_ever_injected_since_start": curated_injected,
         "records_with_hit_count_gt_0": memories_with_hits,

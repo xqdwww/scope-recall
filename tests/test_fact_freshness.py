@@ -388,8 +388,25 @@ def test_context_marks_stale_operational_fact_as_needing_live_check_without_db_w
         assert item["needs_live_check"] is True
         assert item["fact_freshness_status"] == "needs_live_check"
         assert "needs-live-check" in payload["context"]
-        # Telemetry V1 adds telemetry events + memory updates
-        assert after_changes == before_changes + 4
+        # Telemetry V1 records distinct lexical candidate paths, selected, and
+        # injected stages; aggregate updates are part of the injected transaction.
+        assert after_changes > before_changes
+        with plugin._lock:
+            conn = plugin._require_conn()
+            stages = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT stage FROM retrieval_events WHERE memory_id = ?",
+                    (memory_id,),
+                ).fetchall()
+            }
+            aggregate = conn.execute(
+                "SELECT hit_count, last_retrieved_at FROM memories WHERE id = ?",
+                (memory_id,),
+            ).fetchone()
+        assert stages == {"candidate", "selected", "injected"}
+        assert aggregate[0] == 1
+        assert aggregate[1]
     finally:
         plugin.shutdown()
 
